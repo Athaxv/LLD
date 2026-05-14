@@ -1,0 +1,44 @@
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum LockerSize {
+  SMALL
+  MEDIUM
+  LARGE
+}
+
+enum LockerStatus {
+  AVAILABLE
+  OCCUPIED
+  RESERVED
+  NOT_IN_SERVICE
+}
+
+enum PackageStatus {
+  CREATED
+  DELIVERED
+  PICKED_UP
+}
+
+model Package {
+  id String @id @default(uuid())
+  status PackageStatus @default(CREATED)
+  size LockerSize
+  customerId String
+  createdAt DateTime @default(now())
+}
+
+model Locker {
+  id String @id @default(uuid())
+  status LockerStatus @default(AVAILABLE)
+  size LockerSize
+  currentPkgId String?
+  createdAt DateTime @default(now())
+}
