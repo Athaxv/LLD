@@ -12,7 +12,16 @@ export async function slidingWindow(req: Request, res: Response, next: NextFunct
     const now = Date.now()
     const startWindow = now - window * 1000;
 
-    // Redis each commands are atomic, 
+    // Individual Redis commands are atomic.
+    //
+    // However, the Sliding Window algorithm consists of multiple
+    // commands (remove → count → decide → insert → expire).
+    //
+    // If these commands are executed separately, another request
+    // can observe stale state between them.
+    //
+    // Executing the entire algorithm as a Lua script makes the
+    // whole rate limiter atomic.
     // but the current algorithm is not atomic, in different servers it can create bug, 
     // as the current algorithm does not executes these 4 round calls as itself one call
     // so we need to add Lua to it
