@@ -1,6 +1,6 @@
 # Rate Limiter
 
-A Redis-backed HTTP rate limiter built with **Express**, **Bun**, and **TypeScript**. It demonstrates two classic limiting strategies — fixed window and sliding window — and why **Lua scripts** are needed for atomicity in production.
+A Redis-backed HTTP rate limiter built with **Express**, **Bun**, and **TypeScript**. It demonstrates three classic limiting strategies — fixed window, sliding window, and token bucket — and why **Lua scripts** are needed for atomicity in production.
 
 ## What We Built
 
@@ -10,9 +10,10 @@ A Redis-backed HTTP rate limiter built with **Express**, **Bun**, and **TypeScri
 | Redis client | `src/client.ts` | Shared `redis` client connected via `REDIS_URL` |
 | Fixed window | `src/ratelimiter/fixedWindow.ts` | Counter per IP using `INCR` + `EXPIRE` |
 | Sliding window | `src/ratelimiter/slidingWindow.ts` | Timestamp log per IP using a Redis **sorted set**, wrapped in a **Lua script** |
+| Token bucket | `src/ratelimiter/tokenBucket.ts` | Smooth refill using a Redis **hash** (`token` + `lastRefillTime`); Lua script included for atomicity |
 | Redis service | `docker-compose.yml` | Runs Redis 7 locally on port `6379` |
 
-**Default limits (both algorithms):** 10 requests per 30 seconds per IP.
+**Default limits:** fixed/sliding = 10 requests per 30s per IP; token bucket = capacity 10, refill 2 tokens/sec.
 
 ---
 
@@ -23,15 +24,17 @@ Client Request
       │
       ▼
  Express Middleware  ──►  Redis
- (fixed or sliding)        │
-                           ├─ Fixed:  STRING key  (counter)
-                           └─ Sliding: ZSET key   (timestamps)
+ (fixed / sliding /        │
+  token bucket)            ├─ Fixed:  STRING key  (counter)
+                           ├─ Sliding: ZSET key   (timestamps)
+                           └─ Token:   HASH key   (tokens + last refill)
 ```
 
 Each client IP gets its own Redis key:
 
 - Fixed window: `rate_limit:<ip>`
 - Sliding window: `rate_limiter:<ip>`
+- Token bucket: `rate_limiter:<ip>`
 
 ---
 
@@ -155,6 +158,54 @@ return count + 1   -- allowed; return new request count
 
 ---
 
+### 3. Token Bucket (`tokenBucket.ts`)
+
+Models each IP as a bucket that holds tokens. Tokens refill continuously over time. Each request costs 1 token; if none are left, the request is rejected.
+
+**Defaults:** `capacity = 10`, `refillRate = 2` tokens/second.
+
+**Flow:**
+
+1. Read bucket state from a Redis hash (`token`, `lastRefillTime`)
+2. Compute elapsed time and refill: `tokens = min(capacity, tokens + elapsed * refillRate)`
+3. If `tokens >= 1`, consume one and allow; otherwise return `429`
+4. Persist updated state with `HSET` and set idle `EXPIRE`
+
+**Pros:** Allows short bursts up to capacity while enforcing a steady average rate. Feels smoother than fixed windows.
+
+**Cons:** Needs careful atomic updates across read → refill → consume → write.
+
+#### Redis Commands Used
+
+| Command | Purpose |
+|---------|---------|
+| [`HMGET`](https://redis.io/docs/latest/commands/hmget/) / [`HGETALL`](https://redis.io/docs/latest/commands/hgetall/) | Read current token count and last refill timestamp |
+| [`HSET`](https://redis.io/docs/latest/commands/hset/) | Write updated token count and refill time |
+| [`EXPIRE`](https://redis.io/docs/latest/commands/expire/) | Drop inactive buckets (e.g. after 1 hour) |
+
+#### Production Issue (Non-Atomic)
+
+The active middleware path uses separate `hGetAll` / `hSet` round trips. Two concurrent requests can both read the same token count and both pass — overspending the bucket.
+
+#### Lua Script (Included in File)
+
+Wrap refill + consume in one atomic script:
+
+```lua
+-- ARGV[1] = now (ms)
+-- ARGV[2] = capacity
+-- ARGV[3] = refillRate (tokens per second)
+
+local data = redis.call("HMGET", KEYS[1], "token", "lastRefillTime")
+-- initialize or refill, then consume 1 token if available
+-- HSET updated state + EXPIRE 3600
+-- return 1 (allowed) or 0 (rejected)
+```
+
+Wire it with `client.eval(tokenBucketScript, { keys: [key], arguments: [...] })` when you want multi-server safety.
+
+---
+
 ## Response Headers
 
 The fixed-window middleware sets:
@@ -198,13 +249,14 @@ bun install
 bun run src/index.ts
 ```
 
-By default, `src/index.ts` uses the **fixed window** middleware. To switch to sliding window:
+By default, `src/index.ts` uses the **fixed window** middleware. To switch algorithms:
 
 ```typescript
 // src/index.ts
 import { slidingWindow } from "./ratelimiter/slidingWindow";
+import { TokenBucket } from "./ratelimiter/tokenBucket";
 
-app.use(slidingWindow);  // instead of rateLimiter
+app.use(slidingWindow);  // or TokenBucket, instead of rateLimiter
 ```
 
 ### 4. Test
@@ -234,7 +286,8 @@ rate-limiter/
 │   ├── client.ts                 # Redis client singleton
 │   └── ratelimiter/
 │       ├── fixedWindow.ts        # INCR + EXPIRE (fixed window)
-│       └── slidingWindow.ts      # ZSET + Lua (sliding window)
+│       ├── slidingWindow.ts      # ZSET + Lua (sliding window)
+│       └── tokenBucket.ts        # HASH + Lua (token bucket)
 ├── docker-compose.yml            # Redis 7 service
 ├── package.json
 └── tsconfig.json
@@ -242,12 +295,12 @@ rate-limiter/
 
 ---
 
-## Fixed vs Sliding Window
+## Algorithm Comparison
 
-| | Fixed Window | Sliding Window |
-|---|-------------|----------------|
-| **Storage** | String (integer) | Sorted set (timestamps) |
-| **Memory** | O(1) per IP | O(limit) per IP |
-| **Accuracy** | Can allow 2× burst at boundaries | Smooth, no boundary burst |
-| **Atomicity** | Needs Lua (`INCR` + `EXPIRE`) | Needs Lua (4 commands) |
-| **Complexity** | Low | Medium |
+| | Fixed Window | Sliding Window | Token Bucket |
+|---|-------------|----------------|--------------|
+| **Storage** | String (integer) | Sorted set (timestamps) | Hash (tokens + time) |
+| **Memory** | O(1) per IP | O(limit) per IP | O(1) per IP |
+| **Accuracy** | Can allow 2× burst at boundaries | Smooth, no boundary burst | Smooth average rate + burst capacity |
+| **Atomicity** | Needs Lua (`INCR` + `EXPIRE`) | Needs Lua (4 commands) | Needs Lua (`HMGET` → refill → `HSET`) |
+| **Complexity** | Low | Medium | Medium |
